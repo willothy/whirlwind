@@ -448,4 +448,145 @@ where
             shard.write().await.clear();
         }
     }
+
+    /// Provides access to the entry associated with the given key for in-place manipulation.
+    ///
+    /// This method allows you to interact with the map's entry for the specified key using a closure.
+    /// The closure receives the key and the entry (either occupied or vacant) and can modify the map
+    /// accordingly.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    /// use hashbrown::hash_table::Entry;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///
+    ///     let result = map.with_entry("foo", |key, entry| {
+    ///         match entry {
+    ///             Entry::Occupied(entry) => {
+    ///                 let ((_, value), _) = entry.remove();
+    ///                 Some(value)
+    ///             }
+    ///             Entry::Vacant(_) => None,
+    ///         }
+    ///     }).await;
+    ///
+    ///     assert_eq!(result, Some("bar"));
+    ///     assert_eq!(map.contains_key(&"foo").await, false);
+    /// });
+    /// ```
+    pub async fn with_entry<R>(&self, key: K, f: impl FnOnce(K, Entry<(K, V)>) -> R) -> R {
+        let (shard, hash) = self.shard(&key);
+        let mut writer = shard.write().await;
+        let entry = writer.entry(
+            hash,
+            |(k, _)| k == &key,
+            |(k, _)| self.inner.hasher.hash_one(k),
+        );
+        f(key, entry)
+    }
+
+    /// Computes a new value for the specified key using the provided closure.
+    ///
+    /// The closure receives the current value associated with the key (or `None` if the key does not
+    /// exist) and returns an `Option<V>`. If the closure returns `Some(value)`, the key is associated
+    /// with the new value. If it returns `None`, the key is removed from the map (if it existed).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     // Insert a new key-value pair if absent.
+    ///     map.compute("foo", |current| {
+    ///         assert_eq!(current, None);
+    ///         Some("bar")
+    ///     }).await;
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"bar");
+    ///
+    ///     // Update existing key.
+    ///     map.compute("foo", |current| {
+    ///         assert_eq!(current, Some("bar"));
+    ///         Some("baz")
+    ///     }).await;
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"baz");
+    /// });
+    /// ```
+    pub async fn compute<F>(&self, key: K, f: F)
+    where
+        F: FnOnce(Option<V>) -> Option<V>,
+    {
+        self.with_entry(key, |key, entry| match entry {
+            Entry::Occupied(entry) => {
+                let ((_, value), vacant) = entry.remove();
+                if let Some(new_value) = f(Some(value)) {
+                    vacant.insert((key, new_value));
+                }
+            }
+            Entry::Vacant(slot) => {
+                if let Some(value) = f(None) {
+                    slot.insert((key, value));
+                }
+            }
+        })
+        .await
+    }
+
+    /// Inserts a value for the specified key if it is not already present.
+    ///
+    /// If the key does not exist, the provided closure is called to generate a value, which is then
+    /// inserted. If the key exists, no action is taken, and the closure is not called. Returns `true`
+    /// if a new entry was inserted, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     // Insert a new key-value pair.
+    ///     let inserted = map.compute_if_absent("foo", || "bar").await;
+    ///     assert_eq!(inserted, true);
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"bar");
+    ///
+    ///     // Key already exists, no change.
+    ///     let inserted = map.compute_if_absent("foo", || "baz").await;
+    ///     assert_eq!(inserted, false);
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"bar");
+    /// });
+    /// ```
+    pub async fn compute_if_absent<F>(&self, key: K, f: F) -> bool
+    where
+        F: FnOnce() -> V,
+    {
+        let mut inserted = false;
+        self.compute(key, |current| match current {
+            Some(value) => Some(value),
+            None => {
+                inserted = true;
+                Some(f())
+            }
+        })
+        .await;
+        inserted
+    }
 }
