@@ -120,4 +120,9 @@ where
     pub async fn clear(&self) {
         self.inner.clear().await;
     }
+
+    /// Returns an iterator over the values in the set.
+    pub async fn iter<'a>(&'a self) -> impl Iterator<Item = &'a T> {
+        self.inner.keys().await
+    }
 }

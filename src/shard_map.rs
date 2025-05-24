@@ -18,14 +18,15 @@
 //!    assert_eq!(map.remove(&"foo").await, Some("bar"));
 //! });
 //! ```
+use crossbeam_utils::CachePadded;
+use futures::future::join_all;
+use hashbrown::hash_table::{Entry, Iter, IterMut};
 use std::{
     hash::{BuildHasher, RandomState},
     sync::{Arc, OnceLock},
 };
 
-use crossbeam_utils::CachePadded;
-use hashbrown::hash_table::Entry;
-
+use crate::shard::{ShardReader, ShardWriter};
 use crate::{
     mapref::{MapRef, MapRefMut},
     shard::Shard,
@@ -447,5 +448,276 @@ where
         for shard in self.inner.iter() {
             shard.write().await.clear();
         }
+    }
+
+    /// Returns an iterator over the key-value pairs in the map.
+    ///
+    /// **Warning**: This method acquires read locks on *all* shards of the map, which may block other operations
+    /// (such as `insert`, `remove`, or `get_mut`) until the iterator is dropped. Use with caution in
+    /// concurrent environments to avoid performance bottlenecks.
+    ///
+    /// The iterator yields references to the key-value pairs in the map, allowing read-only access to the
+    /// map's contents. The order of iteration is not guaranteed, as it depends on the internal sharding
+    /// structure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///     map.insert("baz", "qux").await;
+    ///
+    ///     let mut pairs = Vec::new();
+    ///     for (key, value) in map.iter().await {
+    ///         pairs.push((key.clone(), value.clone()));
+    ///     }
+    ///
+    ///     assert_eq!(pairs.len(), 2);
+    ///     assert!(pairs.contains(&(&"foo", &"bar")));
+    ///     assert!(pairs.contains(&(&"baz", &"qux")));
+    /// });
+    /// ```
+    pub async fn iter(&self) -> ShardIter<K, V> {
+        let guard_futures = self.inner.iter().map(|shard| shard.read());
+        let guards = join_all(guard_futures).await;
+        ShardIter::new(guards)
+    }
+
+    /// Returns an iterator over the keys in the map.
+    ///
+    /// **Warning**: This method acquires read locks on *all* shards of the map, which may block other operations
+    /// (such as `insert`, `remove`, or `get_mut`) until the iterator is dropped. Use with caution in
+    /// concurrent environments to avoid performance bottlenecks.
+    ///
+    /// The iterator yields references to the keys in the map, allowing read-only access. The order of
+    /// iteration is not guaranteed, as it depends on the internal sharding structure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///     map.insert("baz", "qux").await;
+    ///
+    ///     let mut keys = Vec::new();
+    ///     for key in map.keys().await {
+    ///         keys.push(key.clone());
+    ///     }
+    ///
+    ///     assert_eq!(keys.len(), 2);
+    ///     assert!(keys.contains(&"foo"));
+    ///     assert!(keys.contains(&"baz"));
+    /// });
+    /// ```
+    pub async fn keys<'a>(&'a self) -> impl Iterator<Item = &'a K> {
+        self.iter().await.map(|(k, _)| k)
+    }
+
+    /// Returns an iterator over the values in the map.
+    ///
+    /// **Warning**: This method acquires read locks on *all* shards of the map, which may block other operations
+    /// (such as `insert`, `remove`, or `get_mut`) until the iterator is dropped. Use with caution in
+    /// concurrent environments to avoid performance bottlenecks.
+    ///
+    /// The iterator yields references to the values in the map, allowing read-only access. The order of
+    /// iteration is not guaranteed, as it depends on the internal sharding structure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///     map.insert("baz", "qux").await;
+    ///
+    ///     let mut values = Vec::new();
+    ///     for value in map.values().await {
+    ///         values.push(value.clone());
+    ///     }
+    ///
+    ///     assert_eq!(values.len(), 2);
+    ///     assert!(values.contains(&"bar"));
+    ///     assert!(values.contains(&"qux"));
+    /// });
+    /// ```
+    pub async fn values<'a>(&'a self) -> impl Iterator<Item = &'a V> {
+        self.iter().await.map(|(_, v)| v)
+    }
+
+    /// Returns a mutable iterator over the key-value pairs in the map.
+    ///
+    /// **Warning**: This method acquires write locks on *all* shards of the map, which will block *all*
+    /// other operations (including `get`, `insert`, `remove`, etc.) until the iterator is dropped. Use with
+    /// extreme caution in concurrent environments, as this can significantly impact performance.
+    ///
+    /// The iterator yields mutable references to the key-value pairs in the map, allowing modification of
+    /// the values (but not the keys, as they are immutable). The order of iteration is not guaranteed, as
+    /// it depends on the internal sharding structure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///     map.insert("baz", "qux").await;
+    ///
+    ///     for (key, value) in map.iter_mut().await {
+    ///         if *key == "foo" {
+    ///             *value = "updated";
+    ///         }
+    ///     }
+    ///
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"updated");
+    ///     assert_eq!(map.get(&"baz").await.unwrap().value(), &"qux");
+    /// });
+    /// ```
+    pub async fn iter_mut(&self) -> ShardIterMut<K, V> {
+        let guard_futures = self.inner.iter().map(|shard| shard.write());
+        let guards = join_all(guard_futures).await;
+        ShardIterMut::new(guards)
+    }
+
+    /// Returns a mutable iterator over the values in the map.
+    ///
+    /// **Warning**: This method acquires write locks on *all* shards of the map, which will block *all*
+    /// other operations (including `get`, `insert`, `remove`, etc.) until the iterator is dropped. Use with
+    /// extreme caution in concurrent environments, as this can significantly impact performance.
+    ///
+    /// The iterator yields mutable references to the values in the map, allowing modification of the values.
+    /// The order of iteration is not guaranteed, as it depends on the internal sharding structure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    ///
+    /// rt.block_on(async {
+    ///     map.insert("foo", "bar").await;
+    ///     map.insert("baz", "qux").await;
+    ///
+    ///     for value in map.values_mut().await {
+    ///         if *value == "bar" {
+    ///             *value = "updated";
+    ///         }
+    ///     }
+    ///
+    ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"updated");
+    ///     assert_eq!(map.get(&"baz").await.unwrap().value(), &"qux");
+    /// });
+    /// ```
+    pub async fn values_mut<'a>(&'a self) -> impl Iterator<Item = &'a mut V> {
+        self.iter_mut().await.map(|(_, v)| v)
+    }
+}
+
+pub struct ShardIter<'a, K, V> {
+    _guards: Vec<ShardReader<'a, K, V>>,
+    iters: Vec<Iter<'a, (K, V)>>,
+    current_shard: usize,
+}
+
+impl<'a, K, V> ShardIter<'a, K, V> {
+    fn new(guards: Vec<ShardReader<'a, K, V>>) -> Self {
+        // SAFETY: We're extending the lifetime of the HashMap references
+        // The guards ensure the HashMaps remain valid for the lifetime of the iterator
+        let iters: Vec<_> = guards
+            .iter()
+            .map(|guard| unsafe {
+                std::mem::transmute::<Iter<'_, (K, V)>, Iter<'_, (K, V)>>(guard.iter())
+            })
+            .collect();
+
+        Self {
+            _guards: guards,
+            iters,
+            current_shard: 0,
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for ShardIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_shard < self.iters.len() {
+            if let Some(item) = self.iters[self.current_shard].next() {
+                let (key, value) = item;
+                return Some((key, value));
+            }
+            self.current_shard += 1;
+        }
+        None
+    }
+}
+
+pub struct ShardIterMut<'a, K, V> {
+    _guards: Vec<ShardWriter<'a, K, V>>,
+    iters: Vec<IterMut<'a, (K, V)>>,
+    current_shard: usize,
+}
+
+impl<'a, K, V> ShardIterMut<'a, K, V> {
+    fn new(mut guards: Vec<ShardWriter<'a, K, V>>) -> Self {
+        // SAFETY: We're extending the lifetime of the HashMap references
+        // The guards ensure the HashMaps remain valid for the lifetime of the iterator
+        let iters: Vec<_> = guards
+            .iter_mut()
+            .map(|guard| unsafe {
+                std::mem::transmute::<IterMut<'_, (K, V)>, IterMut<'_, (K, V)>>(guard.iter_mut())
+            })
+            .collect();
+
+        Self {
+            _guards: guards,
+            iters,
+            current_shard: 0,
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for ShardIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_shard < self.iters.len() {
+            if let Some(item) = self.iters[self.current_shard].next() {
+                let (key, value) = item;
+                return Some((key, value));
+            }
+            self.current_shard += 1;
+        }
+        None
     }
 }
