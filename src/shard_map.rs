@@ -477,7 +477,8 @@ where
     ///             }
     ///             Entry::Vacant(_) => None,
     ///         }
-    ///     }).await;
+    ///     })
+    ///     .await;
     ///
     ///     assert_eq!(result, Some("bar"));
     ///     assert_eq!(map.contains_key(&"foo").await, false);
@@ -515,14 +516,16 @@ where
     ///     map.compute("foo", |current| {
     ///         assert_eq!(current, None);
     ///         Some("bar")
-    ///     }).await;
+    ///     })
+    ///     .await;
     ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"bar");
     ///
     ///     // Update existing key.
     ///     map.compute("foo", |current| {
     ///         assert_eq!(current, Some("bar"));
     ///         Some("baz")
-    ///     }).await;
+    ///     })
+    ///     .await;
     ///     assert_eq!(map.get(&"foo").await.unwrap().value(), &"baz");
     /// });
     /// ```
