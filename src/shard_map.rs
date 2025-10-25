@@ -661,22 +661,18 @@ where
     K: Eq + std::hash::Hash + 'static,
     V: 'static,
 {
-    /// Iterate (&K, &V) for this shard.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.guard.iter().map(|(k, v)| (k, v))
     }
 
-    /// Iterate keys by ref.
     pub fn keys(&self) -> impl Iterator<Item = &K> {
         self.guard.iter().map(|(k, _)| k)
     }
 
-    /// Iterate values by ref.
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.guard.iter().map(|(_, v)| v)
     }
 
-    /// Number of entries in this shard.
     pub fn len(&self) -> usize {
         self.guard.len()
     }
