@@ -26,6 +26,16 @@ use std::{
 use crossbeam_utils::CachePadded;
 use hashbrown::hash_table::Entry;
 
+#[cfg(feature = "stream")]
+use async_stream::stream;
+#[cfg(feature = "stream")]
+use futures::{
+    future::StreamExt,
+    pin_mut,
+    stream::{self, Stream},
+    Future,
+};
+
 use crate::{
     mapref::{MapRef, MapRefMut},
     shard::Shard,
@@ -167,8 +177,7 @@ where
         }
         let shard_capacity = cap / shards;
 
-        let shards = std::iter::repeat(())
-            .take(shards)
+        let shards = std::iter::repeat_n((), shards)
             .map(|_| CachePadded::new(Shard::with_capacity(shard_capacity)))
             .collect();
 
@@ -447,5 +456,232 @@ where
         for shard in self.inner.iter() {
             shard.write().await.clear();
         }
+    }
+
+    /// Stream over all shards in the map.
+    ///
+    /// Each item is a `ShardRead` that *holds a read-lock* on that shard while you iterate it
+    /// synchronously. Writes to **other shards** continue to proceed concurrently.
+    ///
+    /// # Example
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use futures::{pin_mut, StreamExt};
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    /// rt.block_on(async {
+    ///     map.insert(1, "a").await;
+    ///     map.insert(2, "b").await;
+    ///
+    ///     let shards = map.stream_shards();
+    ///     pin_mut!(shards); // Stream is not Unpin
+    ///
+    ///     let mut seen = 0;
+    ///     while let Some(sh) = shards.next().await {
+    ///         for (_k, _v) in sh.iter() {
+    ///             seen += 1;
+    ///         }
+    ///     }
+    ///     assert_eq!(seen, 2);
+    /// });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub fn stream_shards(&self) -> impl Stream<Item = ShardRead<'_, K, V>> + '_ {
+        let total = self.inner.len();
+
+        stream::unfold(0usize, move |mut idx| async move {
+            if idx >= total {
+                return None;
+            }
+
+            // SAFETY: idx is checked against total above.
+            let shard = unsafe { self.inner.get_unchecked(idx) };
+
+            let guard = shard.read().await;
+
+            idx += 1;
+            Some((ShardRead { guard }, idx))
+        })
+    }
+
+    /// Flattened stream of **owned** `(K, V)` items.
+    ///
+    /// Locks one shard at a time, snapshots (clones) its entries into a `Vec`, drops the lock,
+    /// then yields items. This allows concurrent writes to other shards.
+    ///
+    /// # Example
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use futures::{pin_mut, StreamExt};
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    /// rt.block_on(async {
+    ///     map.insert(1, "a".to_string()).await;
+    ///     map.insert(2, "b".to_string()).await;
+    ///
+    ///     let s = map.stream_owned();
+    ///     pin_mut!(s); // Stream is not Unpin
+    ///
+    ///     let mut items = Vec::new();
+    ///     while let Some((k, v)) = s.next().await {
+    ///         items.push((k, v));
+    ///     }
+    ///     items.sort_by_key(|(k, _)| *k);
+    ///     assert_eq!(items, vec![(1, "a".into()), (2, "b".into())]);
+    /// });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub fn stream_owned(&self) -> impl Stream<Item = (K, V)> + '_
+    where
+        K: Clone,
+        V: Clone,
+    {
+        let shard_stream = self.stream_shards();
+
+        stream! {
+            pin_mut!(shard_stream);
+
+            while let Some(shard) = shard_stream.next().await {
+                let items: Vec<(K, V)> =
+                    shard.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                drop(shard);
+                for item in items {
+                    yield item;
+                }
+            }
+        }
+    }
+
+    /// Collect all entries into a `Vec<(K, V)>` by cloning.
+    ///
+    /// Iterates shard-by-shard, cloning items under a read lock, then releasing the lock
+    /// before pushing into the result.
+    ///
+    /// # Example
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    /// rt.block_on(async {
+    ///     map.insert(1, "a".to_string()).await;
+    ///     map.insert(2, "b".to_string()).await;
+    ///
+    ///     let mut items = map.entries().await;
+    ///     items.sort_by_key(|(k, _)| *k);
+    ///     assert_eq!(items, vec![(1, "a".into()), (2, "b".into())]);
+    /// });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub async fn entries(&self) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.stream_owned().collect::<Vec<(K, V)>>().await
+    }
+
+    /// Collect all keys into a `Vec<K>` by cloning.
+    ///
+    /// # Example
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    /// rt.block_on(async {
+    ///     map.insert(10, "x").await;
+    ///     map.insert(20, "y").await;
+    ///
+    ///     let mut ks = map.keys().await;
+    ///     ks.sort();
+    ///     assert_eq!(ks, vec![10, 20]);
+    /// });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub async fn keys(&self) -> Vec<K>
+    where
+        K: Clone,
+    {
+        self.stream_owned()
+            .map(|(k, _v)| k)
+            .collect::<Vec<K>>()
+            .await
+    }
+
+    /// Collect all values into a `Vec<V>` by cloning.
+    ///
+    /// # Example
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use std::sync::Arc;
+    /// use whirlwind::ShardMap;
+    ///
+    /// let rt = Runtime::new().unwrap();
+    /// let map = Arc::new(ShardMap::new());
+    /// rt.block_on(async {
+    ///     map.insert(1, "a".to_string()).await;
+    ///     map.insert(2, "b".to_string()).await;
+    ///
+    ///     let mut vs = map.values().await;
+    ///     vs.sort();
+    ///     assert_eq!(vs, vec!["a".to_string(), "b".to_string()]);
+    /// });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub async fn values(&self) -> Vec<V>
+    where
+        V: Clone,
+    {
+        self.stream_owned()
+            .map(|(_k, v)| v)
+            .collect::<Vec<V>>()
+            .await
+    }
+}
+
+#[cfg(feature = "stream")]
+pub struct ShardRead<'a, K, V> {
+    guard: crate::shard::ShardReader<'a, K, V>,
+}
+
+#[cfg(feature = "stream")]
+impl<'a, K, V> ShardRead<'a, K, V>
+where
+    K: Eq + std::hash::Hash + 'static,
+    V: 'static,
+{
+    /// Iterate (&K, &V) for this shard.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.guard.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Iterate keys by ref.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.guard.iter().map(|(k, _)| k)
+    }
+
+    /// Iterate values by ref.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.guard.iter().map(|(_, v)| v)
+    }
+
+    /// Number of entries in this shard.
+    pub fn len(&self) -> usize {
+        self.guard.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.guard.len() == 0
     }
 }
