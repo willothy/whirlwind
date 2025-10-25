@@ -30,10 +30,9 @@ use hashbrown::hash_table::Entry;
 use async_stream::stream;
 #[cfg(feature = "stream")]
 use futures::{
-    future::StreamExt,
     pin_mut,
     stream::{self, Stream},
-    Future,
+    StreamExt,
 };
 
 use crate::{
@@ -458,6 +457,7 @@ where
         }
     }
 
+    #[cfg(feature = "stream")]
     /// Stream over all shards in the map.
     ///
     /// Each item is a `ShardRead` that *holds a read-lock* on that shard while you iterate it
@@ -488,7 +488,6 @@ where
     ///     assert_eq!(seen, 2);
     /// });
     /// ```
-    #[cfg(feature = "stream")]
     pub fn stream_shards(&self) -> impl Stream<Item = ShardRead<'_, K, V>> + '_ {
         let total = self.inner.len();
 
@@ -507,6 +506,7 @@ where
         })
     }
 
+    #[cfg(feature = "stream")]
     /// Flattened stream of **owned** `(K, V)` items.
     ///
     /// Locks one shard at a time, snapshots (clones) its entries into a `Vec`, drops the lock,
@@ -536,7 +536,6 @@ where
     ///     assert_eq!(items, vec![(1, "a".into()), (2, "b".into())]);
     /// });
     /// ```
-    #[cfg(feature = "stream")]
     pub fn stream_owned(&self) -> impl Stream<Item = (K, V)> + '_
     where
         K: Clone,
@@ -558,6 +557,7 @@ where
         }
     }
 
+    #[cfg(feature = "stream")]
     /// Collect all entries into a `Vec<(K, V)>` by cloning.
     ///
     /// Iterates shard-by-shard, cloning items under a read lock, then releasing the lock
@@ -580,7 +580,6 @@ where
     ///     assert_eq!(items, vec![(1, "a".into()), (2, "b".into())]);
     /// });
     /// ```
-    #[cfg(feature = "stream")]
     pub async fn entries(&self) -> Vec<(K, V)>
     where
         K: Clone,
@@ -589,6 +588,7 @@ where
         self.stream_owned().collect::<Vec<(K, V)>>().await
     }
 
+    #[cfg(feature = "stream")]
     /// Collect all keys into a `Vec<K>` by cloning.
     ///
     /// # Example
@@ -608,17 +608,22 @@ where
     ///     assert_eq!(ks, vec![10, 20]);
     /// });
     /// ```
-    #[cfg(feature = "stream")]
     pub async fn keys(&self) -> Vec<K>
     where
         K: Clone,
     {
-        self.stream_owned()
-            .map(|(k, _v)| k)
-            .collect::<Vec<K>>()
-            .await
+        let shard_stream = self.stream_shards();
+        pin_mut!(shard_stream);
+        let mut keys = Vec::new();
+        while let Some(shard) = shard_stream.next().await {
+            let mut shard_keys: Vec<K> = shard.keys().cloned().collect();
+            drop(shard);
+            keys.append(&mut shard_keys);
+        }
+        keys
     }
 
+    #[cfg(feature = "stream")]
     /// Collect all values into a `Vec<V>` by cloning.
     ///
     /// # Example
@@ -638,15 +643,19 @@ where
     ///     assert_eq!(vs, vec!["a".to_string(), "b".to_string()]);
     /// });
     /// ```
-    #[cfg(feature = "stream")]
     pub async fn values(&self) -> Vec<V>
     where
         V: Clone,
     {
-        self.stream_owned()
-            .map(|(_k, v)| v)
-            .collect::<Vec<V>>()
-            .await
+        let shard_stream = self.stream_shards();
+        pin_mut!(shard_stream);
+        let mut values = Vec::new();
+        while let Some(shard) = shard_stream.next().await {
+            let mut shard_values: Vec<V> = shard.values().cloned().collect();
+            drop(shard);
+            values.append(&mut shard_values);
+        }
+        values
     }
 }
 
