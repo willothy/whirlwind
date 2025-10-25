@@ -526,6 +526,7 @@ where
     ///     map.insert(2, "b".to_string()).await;
     ///
     ///     let s = map.stream_owned();
+    ///     pin_mut!(s);
     ///
     ///     let mut items = Vec::new();
     ///     while let Some((k, v)) = s.next().await {
