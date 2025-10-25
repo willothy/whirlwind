@@ -120,4 +120,13 @@ where
     pub async fn clear(&self) {
         self.inner.clear().await;
     }
+
+    /// Returns a vector of all values in the set.
+    #[cfg(feature = "stream")]
+    pub async fn values(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.inner.keys().await
+    }
 }
